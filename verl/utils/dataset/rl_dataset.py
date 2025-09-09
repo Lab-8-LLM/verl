@@ -23,6 +23,7 @@ from collections import defaultdict
 from typing import Optional
 
 import datasets
+datasets.builder.has_sufficient_disk_space = lambda needed_bytes, directory=".": True
 import numpy as np
 import torch
 from omegaconf import DictConfig, ListConfig
