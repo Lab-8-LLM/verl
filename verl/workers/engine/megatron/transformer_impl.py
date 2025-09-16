@@ -22,9 +22,10 @@ import torch.distributed
 from megatron.core import parallel_state as mpu
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from omegaconf import OmegaConf
+from tensordict import TensorDict
 
-from verl import DataProto
 from verl.trainer.config import CheckpointConfig
+from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
@@ -137,7 +138,7 @@ class MegatronEngine(BaseEngine):
             override_model_config=self.engine_config.override_mcore_model_config,
             override_ddp_config=self.engine_config.override_ddp_config,
         )
-        print(f"actor_module: {len(module)}")
+        print(f"module: {len(module)}")
 
         if self.engine_config.use_dist_checkpointing:
             load_mcore_dist_weights(module, self.engine_config.dist_checkpointing_path, is_value_model=is_value_model)
@@ -357,8 +358,8 @@ class MegatronEngine(BaseEngine):
         if self._is_offload_optimizer:
             offload_megatron_optimizer(self.optimizer)
 
-    def forward_backward_batch(self, data: DataProto, loss_function: Callable, forward_only=False) -> Any:
-        data.meta_info["sp_size"] = self.engine_config.context_parallel_size
+    def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
+        tu.assign_non_tensor(data, sp_size=self.engine_config.context_parallel_size)
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
         if vpp_size is not None and vpp_size > 1:
             num_batches_divided_by = self.tf_config.microbatch_group_size_per_vp_stage
@@ -383,7 +384,7 @@ class MegatronEngine(BaseEngine):
         n_micro_batch = len(micro_batches)
 
         for micro_batch in micro_batches:
-            micro_batch.meta_info["num_micro_batch"] = n_micro_batch
+            tu.assign_non_tensor(micro_batch, num_micro_batch=n_micro_batch)
 
         forward_backward_func = get_forward_backward_func()
 
@@ -393,7 +394,7 @@ class MegatronEngine(BaseEngine):
             loss_function=loss_function,
         )
 
-        data.meta_info["num_micro_batch"] = n_micro_batch
+        tu.assign_non_tensor(data, num_micro_batch=n_micro_batch)
 
         forward_step = partial(self.forward_step, postprocess_micro_batch_func=postprocess_micro_batch_func)
 
@@ -420,7 +421,7 @@ class MegatronEngine(BaseEngine):
     def forward_step(self, batch_iter, model, postprocess_micro_batch_func):
         raise NotImplementedError("forward_step must be implemented in subclass")
 
-    def postprocess_micro_batch_func(self, output, data: DataProto, forward_only: bool, loss_function):
+    def postprocess_micro_batch_func(self, output, data: TensorDict, forward_only: bool, loss_function):
         raise NotImplementedError("postprocess_micro_batch_func must be implemented in subclass")
 
 
@@ -472,45 +473,69 @@ class EngineTrainModeCtx:
 
 @EngineRegistry.register(model_type="language_model", backend="megatron")
 class MegatronEngineWithLMHead(MegatronEngine):
-    def forward_step(self, batch_iter: Iterator[DataProto], model, postprocess_micro_batch_func):
-        batch: DataProto = next(batch_iter)
-        batch.to(get_device_id())
-
-        if batch.batch is not None:
-            batch.batch = batch.batch.contiguous()
-
-        meta_info = batch.meta_info
-        use_fused_kernels = meta_info.get("use_fused_kernels", False)
-        calculate_entropy = meta_info.get("calculate_entropy", False)
-        temperature = meta_info["temperature"]
-
-        input_ids = batch.batch["input_ids"]
-        attention_mask = batch.batch["attention_mask"].to(bool)
-        position_ids = batch.batch["position_ids"]
+    def prepare_model_inputs(self, batch: TensorDict):
+        batch = batch.to(get_device_id())
+        batch = batch.contiguous()
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"].to(bool)
+        position_ids = batch["position_ids"]
 
         # process vlm inputs
-        batch.batch["attention_mask"] = batch.batch["attention_mask"].to(bool)
-        has_multi_modal_inputs = "multi_modal_inputs" in batch.non_tensor_batch.keys()
+        batch["attention_mask"] = batch["attention_mask"].to(bool)
+        has_multi_modal_inputs = "multi_modal_inputs" in batch.keys()
         if has_multi_modal_inputs:
-            batch.batch["multi_modal_inputs"] = batch.non_tensor_batch["multi_modal_inputs"]
-            batch.batch["multi_modal_inputs_idx"] = torch.Tensor(
-                list(range(len(batch.non_tensor_batch["multi_modal_inputs"])))
-            ).to(torch.int64)
+            batch["multi_modal_inputs"] = batch["multi_modal_inputs"]
+            batch["multi_modal_inputs_idx"] = torch.Tensor(list(range(len(batch["multi_modal_inputs"])))).to(
+                torch.int64
+            )
 
-        if batch.batch["position_ids"].dim() == 3:  # qwen2vl mrope [bs, 3, seq_len]
-            batch.batch["position_ids"] = batch.batch["position_ids"][
+        if batch["position_ids"].dim() == 3:  # qwen2vl mrope [bs, 3, seq_len]
+            batch["position_ids"] = batch["position_ids"][
                 :, 0
             ]  # mcore patch recompute qwen2vl's pos ids during forward
 
         multi_modal_inputs = {}
-        if "multi_modal_inputs" in batch.batch:
-            for key in batch.batch["multi_modal_inputs"][0].keys():
-                idxs = batch.batch["multi_modal_inputs_idx"]
-                mmi = batch.batch["multi_modal_inputs"]
+        if "multi_modal_inputs" in batch.keys():
+            for key in batch["multi_modal_inputs"][0].keys():
+                idxs = batch["multi_modal_inputs_idx"]
+                mmi = batch["multi_modal_inputs"]
                 multi_modal_inputs[key] = torch.cat(
                     [mmi[idx].get(key).to(input_ids.device) for idx in idxs if mmi[idx].get(key) is not None], dim=0
                 )
-        responses = batch.batch["responses"]
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "multi_modal_inputs": multi_modal_inputs,
+        }
+
+    def prepare_model_outputs(self, output: dict, data: TensorDict):
+        calculate_entropy = tu.get_non_tensor_data(data, key="calculate_entropy", default=False)
+        responses = data["responses"]
+        response_length = responses.size(1)
+
+        log_prob = output["log_probs"][:, -response_length - 1 : -1].contiguous()
+        model_output = {"log_probs": log_prob}
+        if calculate_entropy:
+            entropy = output["entropy"][:, -response_length - 1 : -1].contiguous()
+            model_output["entropy"] = entropy
+
+        return model_output
+
+    def forward_step(self, batch_iter: Iterator[TensorDict], model, postprocess_micro_batch_func):
+        batch: TensorDict = next(batch_iter)
+        use_fused_kernels = tu.get_non_tensor_data(batch, key="use_fused_kernels", default=False)
+        calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
+        temperature = batch["temperature"]
+
+        model_inputs = self.prepare_model_inputs(batch)
+        input_ids = model_inputs["input_ids"]
+        attention_mask = model_inputs["attention_mask"]
+        position_ids = model_inputs["position_ids"]
+        multi_modal_inputs = model_inputs["multi_modal_inputs"]
+
+        responses = batch["responses"]
         response_length = responses.size(1)
         label = position_ids.clone()
         label[:, -response_length - 1 : -1] = responses
@@ -573,32 +598,20 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
         return output, partial(postprocess_micro_batch_func, data=batch)
 
-    def postprocess_micro_batch_func(self, output, data: DataProto, forward_only: bool, loss_function):
+    def postprocess_micro_batch_func(self, output, data: TensorDict, forward_only: bool, loss_function):
         # For memory efficiency
         # We move calculation of entropy to compute_log_probs, forward_only == True
-        meta_info = data.meta_info
-        calculate_entropy = meta_info.get("calculate_entropy", False)
-
-        device = output["log_probs"].device
-
-        responses = data.batch["responses"]
-        response_length = responses.size(1)
-
-        log_prob = output["log_probs"][:, -response_length - 1 : -1].contiguous()
-        model_output = {"log_probs": log_prob}
-        if calculate_entropy:
-            entropy = output["entropy"][:, -response_length - 1 : -1].contiguous()
-            model_output["entropy"] = entropy
+        device = data["input_ids"].device
+        local_micro_bsz = data["input_ids"].shape[0]
+        model_output = self.prepare_model_outputs(output, data)
 
         if loss_function is not None:
             loss, metrics = loss_function(model_output=model_output, data=data, dp_group=self.get_data_parallel_group())
             # scale loss by num_micro_batch because megatron will scale loss
             # by n_micro_batch and cp size inside pp schedule
-            n_micro_batch = meta_info["num_micro_batch"]
+            n_micro_batch = data["num_micro_batch"]
             loss = loss * n_micro_batch / mpu.get_context_parallel_world_size()
-
-            global_bsz = meta_info["global_batch_size"]
-            local_micro_bsz = responses.shape[0]
+            global_bsz = data["global_batch_size"]
             loss_scale_factor = local_micro_bsz / (global_bsz / self.get_data_parallel_size())
             loss = loss * loss_scale_factor
         else:
@@ -616,6 +629,35 @@ class MegatronEngineWithLMHead(MegatronEngine):
         return loss, output
 
 
-class MegatronEngineWithValueHead(MegatronEngine):
+@EngineRegistry.register(model_type="value_model", backend="megatron")
+class MegatronEngineWithValueHead(MegatronEngineWithLMHead):
     # for value head
-    pass
+    def forward_step(self, batch_iter, model, postprocess_micro_batch_func):
+        batch: TensorDict = next(batch_iter)
+        model_inputs = self.prepare_model_inputs(batch)
+        input_ids = model_inputs["input_ids"]
+        attention_mask = model_inputs["attention_mask"]
+        position_ids = model_inputs["position_ids"]
+        multi_modal_inputs = model_inputs["multi_modal_inputs"]
+
+        from verl.models.mcore import get_mcore_forward_fn
+
+        forward_fn = get_mcore_forward_fn(self.model_config.hf_config)
+
+        output = forward_fn(
+            model,
+            input_ids,
+            attention_mask,
+            position_ids,
+            sequence_parallel=self.tf_config.sequence_parallel,
+            multi_modal_inputs=multi_modal_inputs,
+            value_model=True,
+        )
+
+        return output, partial(postprocess_micro_batch_func, data=batch)
+
+    def prepare_model_outputs(self, output: dict | torch.Tensor, data: TensorDict):
+        responses = data["responses"]
+        response_length = responses.size(1)
+        output = output[:, -response_length - 1 : -1].contiguous()
+        return {"values": output}

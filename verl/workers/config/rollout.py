@@ -26,6 +26,7 @@ __all__ = [
     "CustomAsyncServerConfig",
     "AgentLoopConfig",
     "TraceConfig",
+    "ServerConfig",
     "RolloutConfig",
 ]
 
@@ -168,3 +169,5 @@ class RolloutConfig(BaseConfig):
     sglang_engine_mode: str = "local"
 
     limit_images: Optional[int] = None
+
+    skip_tokenizer_init: bool = False
