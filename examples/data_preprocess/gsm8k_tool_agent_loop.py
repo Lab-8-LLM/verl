@@ -86,6 +86,22 @@ if __name__ == "__main__":
                         "content": question,
                     },
                 ],
+                "raw_prompt": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a math expert. You are given a question and you need to solve it step by step. "
+                            "Reasoning step by step before any tool call. "
+                            "You should use the `calc_gsm8k_reward` tool after step by step solving the question, "
+                            "before generate final answer at least once and refine your answer if necessary. "
+                            "Put your final answer in the format of `#### <answer>`."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": question,
+                    },
+                ],
                 "ability": "math",
                 "reward_model": {"style": "rule", "ground_truth": solution},
                 "extra_info": {
@@ -103,6 +119,7 @@ if __name__ == "__main__":
                         },
                     },
                     "interaction_kwargs": {
+                        "name": "gsm8k",
                         "query": question,
                         "ground_truth": solution,
                     },
