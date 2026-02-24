@@ -1370,22 +1370,8 @@ class RayPPOTrainer:
                             batch_reward = self._compute_reward_colocate(batch)
                             batch = batch.union(batch_reward)
 
-<<<<<<< HEAD
-                        if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(
-                                data=batch, config=self.config, tokenizer=self.tokenizer
-                            )
-                        else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-                        
-                            for key in reward_extra_infos_dict:
-                                if key != "score":
-                                    this_val = np.array(reward_extra_infos_dict[key])
-                                    metrics.update({f"critic/rewards/{key}": np.mean(this_val)})
-=======
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
->>>>>>> 712de01cdeec2a7e8ef45e5b138294a54bcc6f4a
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
