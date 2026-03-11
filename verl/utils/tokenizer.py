@@ -76,6 +76,7 @@ def hf_processor(name_or_path, **kwargs):
     from transformers import AutoConfig, AutoProcessor
 
     try:
+        print(f"Loading processor from: {name_or_path}")
         processor = AutoProcessor.from_pretrained(name_or_path, **kwargs)
         config = AutoConfig.from_pretrained(name_or_path, **kwargs)
 
@@ -100,6 +101,8 @@ def hf_processor(name_or_path, **kwargs):
                 processor.get_rope_index = types.MethodType(Glm4vModel.get_rope_index, processor)
             case "MllamaProcessor":
                 pass  # MllamaProcessor and MllamaModel doesn't have get_rope_index property
+            case "Gemma3Processor":
+                pass
             case _:
                 raise ValueError(f"Unsupported processor type: {processor.__class__.__name__}")
     except Exception as e:

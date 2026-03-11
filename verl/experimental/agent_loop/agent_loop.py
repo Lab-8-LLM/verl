@@ -240,9 +240,13 @@ class AgentLoopBase(ABC):
         """
         multi_modal_data = {}
         if self.processor is not None:
+            patch_size_val = getattr(self.processor.image_processor, 'patch_size', 14)
             images, videos = await self.dataset_cls.process_vision_info(
-                messages, image_patch_size=self.processor.image_processor.patch_size, config=self.data_config
+                messages, image_patch_size=patch_size_val, config=self.data_config
             )
+            # images, videos = await self.dataset_cls.process_vision_info(
+            #     messages, image_patch_size=self.processor.image_processor.patch_size, config=self.data_config
+            # )
             if images is not None:
                 multi_modal_data["images"] = images
             if videos is not None:
@@ -605,7 +609,11 @@ class AgentLoopWorker:
 
             routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
 
-        multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
+        if output.multi_modal_data:
+            multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
+        else:
+            multi_modal_inputs = {}
+        ## check gemma position id
         position_ids = self._compute_position_ids(input_ids, attention_mask, multi_modal_inputs)
         await self._compute_score(
             output,
@@ -673,6 +681,21 @@ class AgentLoopWorker:
         """Compute position ids for multi-modal inputs."""
         if self.processor is None:
             return compute_position_id_with_mask(attention_mask)  # (1, seq_len)
+        
+        is_gemma_text = not hasattr(self.processor, 'get_rope_index')
+        
+        if is_gemma_text:
+            # Standard 1D position IDs for Gemma 3 (text-only mode)
+            # GSM8K uses standard sequential indexing
+            # input_ids shape: [batch, seq_len]
+            batch_size, seq_len = input_ids.shape
+            device = input_ids.device
+            
+            # Calculate positions based on attention mask (to handle left padding)
+            # We use cumsum to get [0, 0, 1, 2, 3...] for left-padded sequences
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            return position_ids  # (batch, seq_len)
 
         image_grid_thw = multi_modal_inputs.get("image_grid_thw")
         video_grid_thw = multi_modal_inputs.get("video_grid_thw")

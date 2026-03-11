@@ -36,7 +36,7 @@ from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.torch_functional import logprobs_from_logits
-from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
+from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs, get_ulysses_sequence_parallel_rank
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
 
@@ -257,6 +257,26 @@ class DataParallelPPOActor(BasePPOActor):
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                     logits_rmpad.div_(temperature)
+                    
+                    # --- ADD THIS PATCH FOR GEMMA 3 / VLM TEXT TRAINING ---
+                    if self.use_ulysses_sp and is_vlm_model:
+                        # If the model didn't slice the logits internally (which happens in text-only mode),
+                        # we must slice them here to match the already-sliced labels.
+                        if logits_rmpad.shape[0] != input_ids_rmpad_rolled.shape[0]:
+                            # Calculate the slice for this specific rank
+                            sp_rank = get_ulysses_sequence_parallel_rank()
+                            # sp_rank = torch.distributed.get_rank(group=self.ulysses_group)
+                            sp_size = self.ulysses_sequence_parallel_size
+                            total_tokens = logits_rmpad.shape[0]
+                            
+                            start_idx = (total_tokens // sp_size) * sp_rank
+                            end_idx = (total_tokens // sp_size) * (sp_rank + 1)
+                            # Handle potential remainders/padding
+                            if sp_rank == sp_size - 1:
+                                end_idx = total_tokens
+                                
+                            logits_rmpad = logits_rmpad[start_idx:end_idx, :]
+                    # -------------------------------------------------------
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
